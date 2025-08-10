@@ -1,0 +1,13 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: certmanagerdemo-tls-certificate
+  namespace: certmanager-demo
+spec:
+  secretName: certmanagerdemo-tls-secret
+  issuerRef:
+    name: letsencrypt-http01-simple
+    kind: ClusterIssuer
+  commonName: certmanagerdemo.srinman.com
+  dnsNames:
+  - certmanagerdemo.srinman.com

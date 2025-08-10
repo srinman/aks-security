@@ -1,0 +1,1784 @@
+# End-to-End TLS with cert-manager and Self-Signed Root CA
+
+This guide demonstrates **end-to-end TLS encryption** using **cert-manager** with a **self-signed root CA** on Azure Kubernetes Service (AKS). Unlike the [cert-generation-automatedwithcertmanager.md](./cert-generation-automatedwithcertmanager.md) which only encrypts traffic from client to NGINX Ingress, this approach encrypts traffic **from NGINX to application pods** as well. This builds upon concepts from [cert-basics.md](./cert-basics.md) and [cert-generation-basics.md](./cert-generation-basics.md).
+
+## Architecture Overview: End-to-End TLS with Self-Signed Root CA
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                    END-TO-END TLS WITH SELF-SIGNED ROOT CA ON AKS                                  │
+│                                                                                                     │
+│  🌐 CLIENT                  🌉 NGINX INGRESS            🔐 APP POD                 🏛️ CERT-MANAGER   │
+│     (Browser/curl)            (TLS Termination)         (TLS Termination)           (CA & Issuer)     │
+│                                                                                                     │
+│  ┌─────────────────┐      ┌─────────────────────────────────┐      ┌─────────────────┐             │
+│  │ 1. HTTPS Request│      │ 2. NGINX Ingress Controller    │      │ 4. HTTPS Backend │             │
+│  │                 │      │    IP: 128.85.229.216          │      │                 │             │
+│  │ TLS v1.3        │      │ ┌─────────────────────────────┐ │      │ nginx:1.25      │             │
+│  │ ✅ Let's Encrypt│      │ │ Public TLS Cert             │ │      │ ✅ Internal TLS │             │
+│  │    Certificate  │      │ │ (Let's Encrypt signed)      │ │      │    Certificate  │             │
+│  │                 │      │ │ Domain: e2etls.srinman.com  │ │      │ ✅ Mounts       │             │
+│  │ SNI:            │      │ └─────────────────────────────┘ │      │    CA Bundle    │             │
+│  │ e2etls.srinman  │      │                                 │      │                 │             │
+│  │ .com            │      │ ┌─────────────────────────────┐ │      │ Port 8443 HTTPS │             │
+│  └─────────────────┘      │ │ 3. Upstream HTTPS Config    │ │      │ (TLS termination│             │
+│           │                │ │                             │ │      │  in application)│             │
+│           │ HTTPS/443      │ │ upstream backend {          │ │      └─────────────────┘             │
+│           ▼                │ │   server pod-ip:8443;       │ │               ▲                       │
+│  ┌─────────────────┐      │ │   # SSL verification        │ │               │ Mounts TLS Secret     │
+│  │ TLS Handshake   │      │ │   proxy_ssl_verify on;      │ │               │                       │
+│  │ ✅ Cert Valid   │      │ │   proxy_ssl_trusted_cert... │ │      ┌─────────────────┐             │
+│  │ ✅ Chain Valid  │      │ │   proxy_ssl_protocols       │ │      │ 5. TLS Secret   │             │
+│  │ ✅ Trusted CA   │      │ │       TLSv1.2 TLSv1.3;     │ │      │                 │             │
+│  │    (Let's       │      │ │ }                           │ │      │ • tls.crt       │             │
+│  │     Encrypt)    │      │ └─────────────────────────────┘ │      │ • tls.key       │             │
+│  └─────────────────┘      │                                 │      │ • ca.crt        │             │
+│                            │                                 │      │                 │             │
+│                            └─────────────────────────────────┘      │ Generated by    │             │
+│                                             │                       │ cert-manager    │             │
+│                                             │ HTTPS/8443            │ from self-signed│             │
+│                                             ▼                       │ root CA         │             │
+│                                    ┌─────────────────┐              └─────────────────┘             │
+│                                    │ TLS Handshake   │                       ▲                       │
+│                                    │ ✅ Cert Valid   │                       │                       │
+│                                    │ ✅ Chain Valid  │                       │ Issues Certificate    │
+│                                    │ ✅ Trusted CA   │              ┌─────────────────┐             │
+│                                    │    (Self-Signed │              │ 6. cert-manager │             │
+│                                    │     Root CA)    │              │    Components   │             │
+│                                    │ ✅ Pod Identity │              │                 │             │
+│                                    │    Verified     │              │ ClusterIssuer:  │             │
+│                                    └─────────────────┘              │ • self-signed   │             │
+│                                                                     │   root CA       │             │
+│                                    🔍 SECURITY LAYERS:              │                 │             │
+│                                    ===============                  │ Certificate:    │             │
+│                                    1. Client → NGINX: Let's Encrypt │ • per-service   │             │
+│                                    2. NGINX → Pod: Self-Signed CA   │   certificates  │             │
+│                                    3. Pod Identity: mTLS possible   │ • automatic     │             │
+│                                    4. CA Trust: Injected into pods  │   issuance      │             │
+│                                                                     │ • 90-day        │             │
+│                                                                     │   validity      │             │
+│                                                                     └─────────────────┘             │
+│                                                                                                     │
+│  💡 Key Innovation: Two-tier certificate architecture with automated trust distribution            │
+│                                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+## Understanding End-to-End TLS Requirements
+
+### **Why Standard Echoserver Won't Work**
+
+The standard `k8s.gcr.io/echoserver:1.4` image cannot terminate TLS because:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                ECHOSERVER LIMITATIONS                       │
+│                                                             │
+│  ❌ HTTP-only Application:                                 │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ • Only listens on port 8080 (HTTP)                 │   │
+│  │ • No TLS/SSL configuration support                 │   │
+│  │ • No certificate mounting capability               │   │
+│  │ • Cannot validate client certificates              │   │
+│  │ • Single-purpose echo functionality                │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  🎯 Requirements for E2E TLS:                              │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ✅ HTTPS port (443, 8443, etc.)                    │   │
+│  │ ✅ TLS certificate mounting                         │   │
+│  │ ✅ CA bundle trust configuration                    │   │
+│  │ ✅ Modern TLS protocol support                      │   │
+│  │ ✅ Optional: mTLS client verification               │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### **Solution: NGINX Application Pod**
+
+We'll use **NGINX** as our application pod because it provides:
+
+✅ **Native TLS support** with certificate mounting
+✅ **Flexible configuration** for CA trust and client verification  
+✅ **Modern TLS protocols** (TLSv1.2, TLSv1.3)
+✅ **Simple deployment** with standard container image
+✅ **Practical relevance** (real-world web server scenario)
+
+---
+
+## Step 1: Install cert-manager and NGINX Ingress
+
+### **Install cert-manager**
+
+```bash
+# Add the Jetstack Helm repository
+helm repo add jetstack https://charts.jetstack.io
+helm repo update
+
+# Install cert-manager with CRDs
+helm install cert-manager jetstack/cert-manager \
+    --namespace cert-manager \
+    --create-namespace \
+    --version v1.13.3 \
+    --set installCRDs=true \
+    --set global.leaderElection.namespace=cert-manager
+
+# Verify installation
+kubectl get pods --namespace cert-manager
+
+# Expected output:
+# NAME                                      READY   STATUS    RESTARTS   AGE
+# cert-manager-866bd4b8-xxxxx              1/1     Running   0          1m
+# cert-manager-cainjector-6d7b98ff-xxxxx   1/1     Running   0          1m
+# cert-manager-webhook-8df6c974-xxxxx      1/1     Running   0          1m
+```
+
+### **Install NGINX Ingress Controller**
+
+```bash
+# Add the ingress-nginx repository
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo update
+
+# Install the NGINX ingress controller
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+    --namespace ingress-nginx \
+    --create-namespace \
+    --set controller.service.type=LoadBalancer \
+    --set controller.service.externalTrafficPolicy=Local
+
+# Wait for the ingress controller to get an external IP
+kubectl wait --namespace ingress-nginx \
+    --for=condition=ready pod \
+    --selector=app.kubernetes.io/component=controller \
+    --timeout=120s
+
+# Get the external IP address
+INGRESS_IP=$(kubectl get service ingress-nginx-controller \
+    --namespace ingress-nginx \
+    --output jsonpath='{.status.loadBalancer.ingress[0].ip}')
+
+echo "NGINX Ingress External IP: $INGRESS_IP"
+export INGRESS_IP
+```
+
+---
+
+## Step 2: Create Self-Signed Root CA
+
+### **Set Up Domain Variables**
+
+```bash
+# Set domain variables for this demo
+export DOMAIN="e2etls.srinman.com"
+export EMAIL="snmanivel@gmail.com"
+export NAMESPACE="e2etls-demo"
+
+echo "Working with domain: $DOMAIN"
+echo "Contact email: $EMAIL"
+echo "Namespace: $NAMESPACE"
+```
+
+### **Create Self-Signed Root CA ClusterIssuer**
+
+```bash
+# Create self-signed root CA ClusterIssuer
+cat << EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-root-ca
+spec:
+  selfSigned: {}
+EOF
+```
+
+### **Create Root CA Certificate**
+
+```bash
+# Create root CA certificate
+cat << EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: root-ca-certificate
+  namespace: cert-manager
+spec:
+  isCA: true
+  commonName: "E2E TLS Root CA"
+  subject:
+    organizationalUnits:
+    - "AKS Security Lab"
+    organizations:
+    - "Srinman Labs"
+    countries:
+    - "US"
+  secretName: root-ca-secret
+  privateKey:
+    algorithm: RSA
+    size: 4096
+  issuerRef:
+    name: selfsigned-root-ca
+    kind: ClusterIssuer
+    group: cert-manager.io
+  duration: 8760h # 1 year
+  renewBefore: 720h # 30 days
+EOF
+```
+
+### **Create CA Issuer Using Root CA**
+
+```bash
+# Create ClusterIssuer that uses our root CA to sign service certificates
+cat << EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: internal-ca-issuer
+spec:
+  ca:
+    secretName: root-ca-secret
+EOF
+```
+
+### **Create Public TLS ClusterIssuer (Let's Encrypt)**
+
+```bash
+# Create ClusterIssuer for public-facing certificates
+cat << EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-http01
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: $EMAIL
+    privateKeySecretRef:
+      name: letsencrypt-http01-private-key
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+EOF
+```
+
+### **Verify ClusterIssuers**
+
+```bash
+# Check all ClusterIssuers
+kubectl get clusterissuers
+
+# Expected output:
+# NAME                   READY   AGE
+# selfsigned-root-ca     True    1m
+# internal-ca-issuer     True    1m
+# letsencrypt-http01     True    1m
+
+# Verify root CA certificate
+kubectl describe certificate root-ca-certificate --namespace cert-manager
+```
+
+---
+
+## Step 3: Create Application Namespace and CA Trust
+
+### **Create Namespace**
+
+```bash
+# Create namespace for our demo
+kubectl create namespace $NAMESPACE
+```
+
+### **Create CA Bundle ConfigMap**
+
+```bash
+# Extract the root CA certificate and create a ConfigMap for trust distribution
+kubectl get secret root-ca-secret --namespace cert-manager \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/root-ca.crt
+
+# Create ConfigMap with CA bundle
+kubectl create configmap ca-bundle \
+  --namespace $NAMESPACE \
+  --from-file=ca-bundle.crt=/tmp/root-ca.crt
+
+# Clean up temporary file
+rm /tmp/root-ca.crt
+
+# Verify ConfigMap
+kubectl describe configmap ca-bundle --namespace $NAMESPACE
+```
+
+### **Understanding the CA Bundle ConfigMap**
+
+This section creates a **trust distribution mechanism** for the self-signed root CA certificate within the Kubernetes cluster. Here's what each command accomplishes and why it's critical for end-to-end TLS:
+
+#### **Purpose and Context**
+
+In our two-tier certificate architecture:
+1. **selfsigned-root-ca** ClusterIssuer created a root CA certificate  
+2. **internal-ca-issuer** ClusterIssuer uses that root CA to sign service certificates
+3. Now applications need to **trust** certificates signed by our internal CA
+
+#### **Step-by-Step Command Analysis**
+
+**1. Extract Root CA Certificate:**
+```bash
+kubectl get secret root-ca-secret --namespace cert-manager \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > /tmp/root-ca.crt
+```
+- **What it does**: Retrieves the root CA certificate from `root-ca-secret` in cert-manager namespace
+- **How it works**: Uses JSONPath to extract certificate data, base64-decodes it, saves to temporary file
+- **Result**: Plain text root CA certificate ready for distribution
+
+**2. Create ConfigMap with CA Bundle:**
+```bash
+kubectl create configmap ca-bundle \
+  --namespace $NAMESPACE \
+  --from-file=ca-bundle.crt=/tmp/root-ca.crt
+```
+- **What it does**: Creates a ConfigMap containing the root CA certificate  
+- **Why ConfigMap**: ConfigMaps can be easily mounted into pods as files
+- **Naming**: `ca-bundle.crt` is a standard name for CA trust bundles
+- **Namespace**: Created in application namespace for easy access
+
+**3. Security Cleanup:**
+```bash
+rm /tmp/root-ca.crt
+```
+- **Security practice**: Removes temporary certificate file to avoid leaving sensitive data on disk
+
+#### **How This Enables Trust Chain Validation**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    CA BUNDLE USAGE FLOW                    │
+│                                                             │
+│  1. Root CA creates service certificate                    │
+│     (nginx-app-certificate signed by internal-ca-issuer)   │
+│                           ▼                                 │
+│  2. Service presents certificate to client                 │
+│     (NGINX Ingress connecting to nginx-app pod)            │
+│                           ▼                                 │
+│  3. Client checks certificate signature                    │
+│     (Ingress needs to verify service cert is valid)        │
+│                           ▼                                 │
+│  4. Client uses CA bundle to validate signature            │
+│     (ca-bundle.crt contains the root CA public key)        │
+│                           ▼                                 │
+│  5. Trust established - encrypted connection proceeds      │
+│     (End-to-end TLS working properly)                      │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+#### **Application Usage Pattern**
+
+Later in the deployment, applications mount this ConfigMap:
+
+```yaml
+# In the NGINX deployment:
+volumes:
+- name: ca-bundle
+  configMap:
+    name: ca-bundle
+    
+volumeMounts:
+- name: ca-bundle
+  mountPath: /etc/ssl/certs/ca-bundle.crt
+  subPath: ca-bundle.crt
+  readOnly: true
+```
+
+#### **Critical Security Role**
+
+**Without this CA bundle:**
+- ❌ NGINX Ingress Controller would reject backend certificates as "untrusted"
+- ❌ Applications couldn't verify certificates from other services  
+- ❌ End-to-end TLS would fail with certificate validation errors
+
+**With this CA bundle:**
+- ✅ Applications trust certificates signed by our internal CA
+- ✅ Certificate validation works properly throughout the cluster  
+- ✅ End-to-end encryption is established and maintained
+
+This ConfigMap essentially **distributes the public key of our root CA** so that applications can cryptographically verify that service certificates were indeed signed by our trusted internal certificate authority.
+
+---
+
+## Step 4: Deploy NGINX Application with TLS Support
+
+### **Create NGINX Configuration with TLS**
+
+```bash
+# Create NGINX configuration that serves HTTPS and shows certificate information
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-tls-config
+  namespace: $NAMESPACE
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+    
+    http {
+        include /etc/nginx/mime.types;
+        default_type application/octet-stream;
+        
+        # Logging
+        access_log /var/log/nginx/access.log;
+        error_log /var/log/nginx/error.log;
+        
+        # Server block for HTTPS
+        server {
+            listen 8443 ssl http2;
+            server_name _;
+            
+            # TLS Configuration
+            ssl_certificate /etc/ssl/certs/tls.crt;
+            ssl_certificate_key /etc/ssl/certs/tls.key;
+            ssl_trusted_certificate /etc/ssl/certs/ca-bundle.crt;
+            
+            # Modern TLS settings
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+            ssl_prefer_server_ciphers off;
+            
+            # HSTS
+            add_header Strict-Transport-Security "max-age=63072000" always;
+            
+            # Default location
+            location / {
+                return 200 'Hello from NGINX with TLS!
+
+Server Information:
+==================
+Server: \$server_name
+SSL Protocol: \$ssl_protocol
+SSL Cipher: \$ssl_cipher
+Time: \$time_local
+Request ID: \$request_id
+
+TLS Certificate Information:
+===========================
+This server is using a certificate issued by our internal CA.
+The certificate is automatically managed by cert-manager.
+
+Client Information:
+==================
+Remote Address: \$remote_addr
+User Agent: \$http_user_agent
+X-Forwarded-For: \$http_x_forwarded_for
+X-Forwarded-Proto: \$http_x_forwarded_proto
+
+Pod Information:
+===============
+Pod Name: \$hostname
+Namespace: $NAMESPACE
+
+Security Headers:
+================
+HSTS: Strict-Transport-Security header is set
+TLS Version: Modern TLS protocols (1.2, 1.3) only
+';
+                add_header Content-Type text/plain;
+            }
+            
+            # Health check endpoint
+            location /health {
+                return 200 'healthy';
+                add_header Content-Type text/plain;
+                access_log off;
+            }
+            
+            # Certificate information endpoint
+            location /cert-info {
+                return 200 'Certificate Details:
+=====================
+SSL Protocol: \$ssl_protocol
+SSL Cipher: \$ssl_cipher
+SSL Session ID: \$ssl_session_id
+SSL Session Reused: \$ssl_session_reused
+Server Certificate: cert-manager generated
+CA: Internal Root CA
+';
+                add_header Content-Type text/plain;
+            }
+        }
+        
+        # Optional: Redirect HTTP to HTTPS (if HTTP port is exposed)
+        server {
+            listen 8080;
+            server_name _;
+            return 301 https://\$server_name:8443\$request_uri;
+        }
+    }
+EOF
+```
+
+### **Create Certificate for NGINX Application**
+
+```bash
+# Create certificate for the NGINX application pod
+cat << EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nginx-app-certificate
+  namespace: $NAMESPACE
+spec:
+  secretName: nginx-app-tls-secret
+  issuerRef:
+    name: internal-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+  dnsNames:
+  - nginx-app-service.$NAMESPACE.svc.cluster.local
+  - nginx-app-service
+  - localhost
+  commonName: nginx-app-service.$NAMESPACE.svc.cluster.local
+  duration: 2160h # 90 days
+  renewBefore: 720h # 30 days
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  usages:
+  - digital signature
+  - key encipherment
+  - server auth
+EOF
+```
+
+### **Deploy NGINX Application**
+
+```bash
+# Deploy NGINX application with TLS configuration
+cat << EOF | kubectl apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-app
+  namespace: $NAMESPACE
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx-app
+  template:
+    metadata:
+      labels:
+        app: nginx-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.25-alpine
+        ports:
+        - containerPort: 8443
+          name: https
+          protocol: TCP
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        volumeMounts:
+        - name: nginx-config
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+          readOnly: true
+        - name: tls-certs
+          mountPath: /etc/ssl/certs
+          readOnly: true
+        - name: ca-bundle
+          mountPath: /etc/ssl/certs/ca-bundle.crt
+          subPath: ca-bundle.crt
+          readOnly: true
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8443
+            scheme: HTTPS
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      volumes:
+      - name: nginx-config
+        configMap:
+          name: nginx-tls-config
+      - name: tls-certs
+        secret:
+          secretName: nginx-app-tls-secret
+      - name: ca-bundle
+        configMap:
+          name: ca-bundle
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-app-service
+  namespace: $NAMESPACE
+spec:
+  type: ClusterIP
+  selector:
+    app: nginx-app
+  ports:
+  - name: https
+    port: 443
+    targetPort: 8443
+    protocol: TCP
+  - name: http
+    port: 80
+    targetPort: 8080
+    protocol: TCP
+EOF
+```
+
+### **Verify Application Deployment**
+
+```bash
+# Wait for NGINX app deployment
+echo "Waiting for NGINX app deployment..."
+kubectl wait --for=condition=ready pod \
+  --selector=app=nginx-app \
+  --namespace=$NAMESPACE \
+  --timeout=120s
+
+# Check certificate status
+kubectl get certificate nginx-app-certificate --namespace $NAMESPACE
+
+# Verify TLS secret creation
+kubectl get secret nginx-app-tls-secret --namespace $NAMESPACE
+
+# Test internal HTTPS connectivity
+kubectl run test-pod --rm -i --tty \
+  --namespace $NAMESPACE \
+  --image=curlimages/curl:latest -- \
+  curl -k -v https://nginx-app-service.e2etls-demo.svc.cluster.local/health
+
+# Expected: "healthy" response with TLS details
+```
+
+---
+
+## Step 5: Configure NGINX Ingress for E2E TLS
+
+### **Create NGINX Ingress Configuration**
+
+```bash
+# Create custom NGINX configuration snippet for upstream TLS
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-backend-tls-config
+  namespace: $NAMESPACE
+data:
+  backend-protocol: "HTTPS"
+  upstream-ssl-protocols: "TLSv1.2 TLSv1.3"
+  upstream-ssl-ciphers: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
+  upstream-ssl-verify: "on"
+  upstream-ssl-verify-depth: "2"
+EOF
+```
+
+### **Create Ingress Resource with E2E TLS**
+
+```bash
+# Create ingress with both public TLS (Let's Encrypt) and backend TLS configuration
+cat << EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: nginx-app-ingress
+  namespace: $NAMESPACE
+  annotations:
+    # Ingress class
+    kubernetes.io/ingress.class: nginx
+    
+    # Public TLS certificate from Let's Encrypt
+    cert-manager.io/cluster-issuer: letsencrypt-http01
+    
+    # Backend protocol configuration
+    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+    
+    # Upstream SSL configuration for E2E TLS
+    nginx.ingress.kubernetes.io/proxy-ssl-protocols: "TLSv1.2 TLSv1.3"
+    nginx.ingress.kubernetes.io/proxy-ssl-ciphers: "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+    nginx.ingress.kubernetes.io/proxy-ssl-verify-depth: "2"
+    nginx.ingress.kubernetes.io/proxy-ssl-name: "nginx-app-service.$NAMESPACE.svc.cluster.local"
+    
+    # Additional NGINX configuration
+    nginx.ingress.kubernetes.io/proxy-body-size: "0"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - $DOMAIN
+    secretName: e2etls-public-tls-secret
+  rules:
+  - host: $DOMAIN
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: nginx-app-service
+            port:
+              number: 443
+EOF
+```
+
+### **Add CA Bundle to NGINX Ingress Controller**
+
+We need to ensure the NGINX Ingress Controller trusts our self-signed CA:
+
+```bash
+# Create a secret with the CA bundle for the ingress controller
+kubectl create secret generic internal-ca-bundle \
+  --namespace ingress-nginx \
+  --from-file=ca.crt=/tmp/root-ca.crt || \
+kubectl get secret root-ca-secret --namespace cert-manager \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+kubectl create secret generic internal-ca-bundle \
+  --namespace ingress-nginx \
+  --from-file=ca.crt=/dev/stdin
+
+# Update NGINX Ingress Controller to use the CA bundle
+helm upgrade ingress-nginx ingress-nginx/ingress-nginx \
+    --namespace ingress-nginx \
+    --set controller.extraVolumes[0].name=ca-bundle \
+    --set controller.extraVolumes[0].secret.secretName=internal-ca-bundle \
+    --set controller.extraVolumeMounts[0].name=ca-bundle \
+    --set controller.extraVolumeMounts[0].mountPath=/etc/ssl/certs/ca-bundle.crt \
+    --set controller.extraVolumeMounts[0].subPath=ca.crt \
+    --set controller.extraVolumeMounts[0].readOnly=true \
+    --set controller.service.type=LoadBalancer \
+    --set controller.service.externalTrafficPolicy=Local
+
+# Wait for rollout to complete
+kubectl rollout status deployment/ingress-nginx-controller --namespace ingress-nginx
+```
+
+### **Configure NGINX Ingress for CA Trust**
+
+```bash
+# Create a ConfigMap that adds the CA bundle to NGINX's trusted certificates
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-ingress-ca-config
+  namespace: ingress-nginx
+data:
+  proxy-ssl-trusted-certificate: "/etc/ssl/certs/ca-bundle.crt"
+EOF
+
+# Update the NGINX Ingress Controller configuration
+kubectl patch configmap ingress-nginx-controller \
+  --namespace ingress-nginx \
+  --patch '{"data":{"proxy-ssl-trusted-certificate":"/etc/ssl/certs/ca-bundle.crt"}}'
+
+# Restart NGINX Ingress Controller to pick up the new configuration
+kubectl rollout restart deployment/ingress-nginx-controller --namespace ingress-nginx
+kubectl wait --for=condition=ready pod \
+  --selector=app.kubernetes.io/name=ingress-nginx \
+  --namespace ingress-nginx \
+  --timeout=120s
+```
+
+---
+
+## Step 6: DNS Configuration and Testing
+
+### **Configure DNS A Record**
+
+```bash
+# Display DNS record information for manual creation
+cat << EOF
+
+📋 DNS A RECORD CONFIGURATION REQUIRED:
+=====================================
+
+Domain: $DOMAIN
+Record Type: A
+Value: $INGRESS_IP (NGINX Ingress Controller IP)
+TTL: 300 seconds (5 minutes)
+
+🔗 Azure CLI Command for DNS Administrator:
+az network dns record-set a add-record \\
+  --resource-group <resource-group-name> \\
+  --zone-name srinman.com \\
+  --record-set-name e2etls \\
+  --ipv4-address $INGRESS_IP
+
+EOF
+```
+
+### **Wait for DNS Propagation**
+
+```bash
+# Wait for DNS propagation
+echo "Testing DNS resolution..."
+while true; do
+    IP=$(dig +short $DOMAIN)
+    if [ "$IP" = "$INGRESS_IP" ]; then
+        echo "✅ DNS A record resolved correctly: $DOMAIN → $INGRESS_IP"
+        break
+    else
+        echo "⏳ Waiting for DNS propagation... Current: $IP, Expected: $INGRESS_IP"
+        sleep 30
+    fi
+done
+```
+
+---
+
+## Step 7: Monitor Certificate Creation and Verify E2E TLS
+
+### **Monitor Certificate Creation**
+
+```bash
+# Watch certificate creation process
+kubectl get certificates --namespace $NAMESPACE --watch
+
+# Check certificate status
+kubectl describe certificate e2etls-public-tls-secret --namespace $NAMESPACE
+kubectl describe certificate nginx-app-certificate --namespace $NAMESPACE
+
+# Check ingress status
+kubectl describe ingress nginx-app-ingress --namespace $NAMESPACE
+```
+
+### **Test End-to-End TLS**
+
+```bash
+# Test the complete E2E TLS flow
+curl -v https://$DOMAIN/
+
+# Expected response includes:
+# - TLS handshake with Let's Encrypt certificate
+# - Response from NGINX application showing certificate details
+# - Evidence of backend HTTPS communication
+
+# Test certificate information endpoint
+curl -v https://$DOMAIN/cert-info
+
+# Test with verbose SSL debugging
+curl -v --trace-ascii /dev/stdout https://$DOMAIN/ 2>&1 | head -50
+```
+
+### **Verify Certificate Chain**
+
+```bash
+# Check the public certificate chain (Let's Encrypt)
+echo | openssl s_client -connect $DOMAIN:443 -servername $DOMAIN 2>/dev/null | openssl x509 -noout -issuer -subject -dates
+
+# Expected:
+# issuer=C = US, O = Let's Encrypt, CN = R3
+# subject=CN = e2etls.srinman.com
+# notBefore=... (today's date)
+# notAfter=... (90 days from today)
+
+# Check certificate chain verification
+openssl s_client -connect $DOMAIN:443 -servername $DOMAIN -verify_return_error
+
+# Expected: "Verification OK" or "Verify return code: 0 (ok)"
+```
+
+### **Test Backend TLS Certificate**
+
+```bash
+# Test backend certificate directly (from within cluster)
+kubectl run tls-test --rm -i --tty \
+  --namespace $NAMESPACE \
+  --image=curlimages/curl:latest -- \
+  curl -k -v https://nginx-app-service.e2etls-demo.svc.cluster.local/cert-info
+
+# This should show:
+# - TLS handshake with our internal CA certificate
+# - Certificate details from nginx-app
+# - SSL protocol and cipher information
+
+# Test with certificate verification enabled
+kubectl run tls-test-verify --rm -i --tty \
+  --namespace $NAMESPACE \
+  --image=curlimages/curl:latest -- sh -c '
+    curl --cacert /etc/ssl/certs/ca-bundle.crt \
+         -v https://nginx-app-service.'$NAMESPACE'.svc.cluster.local/cert-info
+  '
+```
+
+### **Comprehensive Backend TLS Verification**
+
+To verify that the NGINX Ingress Controller is successfully connecting to backend pods over TLS, use these multiple verification methods:
+
+#### **Method 1: Ingress Controller Log Analysis**
+
+```bash
+# Check ingress controller logs for HTTPS upstream communication
+kubectl logs -n ingress-nginx deployment/ingress-nginx-controller --tail=50 | \
+  grep -E "(upstream|ssl|https|tls|backend)" -i
+
+# Look for entries showing:
+# - "upstream: https://10.244.x.x:8443/" (proves HTTPS backend communication)
+# - SSL handshake success messages
+# - TLS protocol negotiation details
+```
+
+#### **Method 2: Ingress Annotation Verification**
+
+```bash
+# Verify ingress is configured for backend TLS
+kubectl get ingress nginx-app-ingress -n $NAMESPACE -o yaml | \
+  grep -A 20 annotations
+
+# Expected annotations confirming backend TLS:
+# - nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
+# - nginx.ingress.kubernetes.io/proxy-ssl-verify: "on"
+# - nginx.ingress.kubernetes.io/proxy-ssl-protocols: "TLSv1.2 TLSv1.3"
+# - nginx.ingress.kubernetes.io/proxy-ssl-name: "nginx-app-service..."
+```
+
+#### **Method 3: Direct TLS Certificate Testing from Ingress Controller**
+
+```bash
+# Test TLS connection from ingress controller to backend service
+kubectl exec -n ingress-nginx deployment/ingress-nginx-controller -- \
+  sh -c "echo | openssl s_client -connect nginx-app-service.$NAMESPACE.svc.cluster.local:443 -servername nginx-app-service.$NAMESPACE.svc.cluster.local 2>/dev/null" | \
+  grep -E "(subject|issuer|Protocol|Cipher)"
+
+# Expected output confirms:
+# - subject=CN=nginx-app-service.e2etls-demo.svc.cluster.local
+# - issuer=C=US O=Srinman Labs CN=E2E TLS Root CA
+# - Protocol: TLSv1.3
+# - Cipher: TLS_AES_256_GCM_SHA384 (or similar modern cipher)
+```
+
+#### **Method 4: Network Port Verification**
+
+```bash
+# Verify HTTPS port is listening on backend pods
+kubectl exec -n $NAMESPACE deployment/nginx-app -- \
+  netstat -tlnp 2>/dev/null | grep :8443 || \
+  ss -tlnp | grep :8443
+
+# Expected: Shows port 8443 listening for HTTPS traffic
+```
+
+#### **Method 5: Certificate Chain Validation**
+
+```bash
+# Verify complete certificate chain from ingress controller perspective
+kubectl exec -n ingress-nginx deployment/ingress-nginx-controller -- \
+  openssl s_client -connect nginx-app-service.$NAMESPACE.svc.cluster.local:443 \
+  -CAfile /etc/ssl/certs/ca-bundle.crt -verify_return_error 2>/dev/null | \
+  grep -E "(Verification|return code)"
+
+# Expected: "Verification OK" or "Verify return code: 0 (ok)"
+```
+
+#### **Method 6: Pod-to-Pod TLS Communication Test**
+
+```bash
+# Test direct pod-to-pod TLS communication
+kubectl run debug-pod --rm -i --tty \
+  --namespace $NAMESPACE \
+  --image=nicolaka/netshoot -- \
+  openssl s_client -connect nginx-app-service:443 -servername nginx-app-service.$NAMESPACE.svc.cluster.local
+
+# This provides detailed TLS handshake information and certificate details
+```
+
+#### **Interpreting the Results**
+
+**✅ Successful E2E TLS Indicators:**
+
+1. **Log Analysis**: Shows `upstream: https://` entries with backend pod IPs
+2. **Annotations**: All proxy-ssl annotations properly configured
+3. **Certificate Test**: Returns certificate issued by "E2E TLS Root CA"
+4. **Network Verification**: Port 8443 listening and accepting connections
+5. **Chain Validation**: Certificate verification succeeds with CA bundle
+6. **Protocol**: Modern TLS versions (1.2, 1.3) successfully negotiated
+
+**❌ Common Issues and Solutions:**
+
+```bash
+# If backend TLS verification fails:
+# 1. Check CA bundle is properly mounted in ingress controller
+kubectl exec -n ingress-nginx deployment/ingress-nginx-controller -- \
+  ls -la /etc/ssl/certs/ca-bundle.crt
+
+# 2. Verify ingress controller has been restarted after CA bundle addition
+kubectl rollout status deployment/ingress-nginx-controller -n ingress-nginx
+
+# 3. Check certificate is properly mounted in application pods
+kubectl exec -n $NAMESPACE deployment/nginx-app -- \
+  ls -la /etc/ssl/certs/
+
+# 4. Validate certificate DNS names match service names
+kubectl get certificate nginx-app-certificate -n $NAMESPACE -o yaml | \
+  grep -A 10 dnsNames
+```
+
+---
+
+## Step 8: Understanding the Complete Flow
+
+### **Certificate Architecture Summary**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│            TWO-TIER CERTIFICATE ARCHITECTURE                │
+│                                                             │
+│  🌐 PUBLIC TIER (Internet-facing):                         │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Certificate: Let's Encrypt R3                       │   │
+│  │ Domain: e2etls.srinman.com                          │   │
+│  │ Purpose: Client browser trust                       │   │
+│  │ Issuer: letsencrypt-http01 ClusterIssuer            │   │
+│  │ Secret: e2etls-public-tls-secret                    │   │
+│  │ Used by: NGINX Ingress Controller                   │   │
+│  │ Validation: HTTP-01 ACME challenge                  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ▼                                  │
+│  🏗️ INTERNAL TIER (Cluster-internal):                     │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Certificate: Self-Signed Root CA                    │   │
+│  │ CN: nginx-app-service.e2etls-demo.svc.cluster.local │   │
+│  │ Purpose: Service-to-service encryption              │   │
+│  │ Issuer: internal-ca-issuer ClusterIssuer            │   │
+│  │ Secret: nginx-app-tls-secret                        │   │
+│  │ Used by: NGINX Application Pod                      │   │
+│  │ Validation: CA signature verification               │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  🔗 Trust Chain:                                           │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ 1. Browser trusts Let's Encrypt (public CA)         │   │
+│  │ 2. NGINX Ingress trusts Self-Signed CA (injected)   │   │
+│  │ 3. Application serves Internal CA cert               │   │
+│  │ 4. Complete E2E encryption maintained               │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### **Traffic Flow Analysis**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                 E2E TLS TRAFFIC FLOW                        │
+│                                                             │
+│  Step 1: Client → NGINX Ingress                            │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Protocol: HTTPS/TLS 1.3                            │   │
+│  │ Certificate: Let's Encrypt (publicly trusted)      │   │
+│  │ Verification: Browser validates against public CA  │   │
+│  │ Port: 443                                          │   │
+│  │ Encryption: ✅ Public key cryptography             │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ▼                                  │
+│  Step 2: NGINX Ingress → Application Pod                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Protocol: HTTPS/TLS 1.2+                           │   │
+│  │ Certificate: Internal CA (self-signed root)        │   │
+│  │ Verification: Ingress validates against CA bundle  │   │
+│  │ Port: 8443                                         │   │
+│  │ Encryption: ✅ Private key cryptography            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          ▼                                  │
+│  Step 3: Application Pod Response                          │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ Content: "Hello from NGINX with TLS!"               │   │
+│  │ Headers: SSL protocol, cipher information           │   │
+│  │ Security: Encrypted response back through chain     │   │
+│  │ Proof: Certificate details in response body         │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  🔒 Security Properties Achieved:                          │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ✅ Data encrypted from client to application       │   │
+│  │ ✅ No plaintext transmission anywhere              │   │
+│  │ ✅ Certificate validation at both tiers            │   │
+│  │ ✅ Automated certificate lifecycle management      │   │
+│  │ ✅ Support for certificate rotation                │   │
+│  │ ✅ Compliance with enterprise security standards   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Step 9: Browser Testing and Validation
+
+### **Browser Testing Checklist**
+
+1. **Navigate to your domain**: `https://e2etls.srinman.com`
+
+2. **Verify public TLS certificate**:
+   - ✅ Green lock icon in address bar
+   - ✅ "Connection is secure" message
+   - ✅ Certificate issued by "Let's Encrypt Authority R3"
+   - ✅ Valid for 90 days from issue date
+
+3. **Check application response**:
+   ```
+   Hello from NGINX with TLS!
+
+   Server Information:
+   ==================
+   SSL Protocol: TLSv1.3
+   SSL Cipher: TLS_AES_256_GCM_SHA384
+   Time: [current timestamp]
+   Request ID: [unique request ID]
+
+   TLS Certificate Information:
+   ===========================
+   This server is using a certificate issued by our internal CA.
+   The certificate is automatically managed by cert-manager.
+   ```
+
+4. **Verify certificate details** (click lock → Certificate):
+   - **Issued to**: e2etls.srinman.com
+   - **Issued by**: Let's Encrypt Authority R3
+   - **Valid from**: [today's date]
+   - **Valid to**: [90 days from today]
+
+### **Developer Tools Network Analysis**
+
+1. Open browser Developer Tools (F12)
+2. Go to Network tab
+3. Reload the page
+4. Check the main request:
+   - **Protocol**: h2 (HTTP/2 over TLS)
+   - **Status**: 200
+   - **Certificate**: Let's Encrypt
+   - **TLS Version**: TLS 1.3
+   - **Response headers**: Should include HSTS
+
+---
+
+## Step 10: Advanced Configuration and Monitoring
+
+### **Enable mTLS (Optional)**
+
+For even stronger security, you can enable mutual TLS authentication:
+
+```bash
+# Create client certificates for mTLS (optional advanced feature)
+cat << EOF | kubectl apply -f -
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: client-certificate
+  namespace: $NAMESPACE
+spec:
+  secretName: client-tls-secret
+  issuerRef:
+    name: internal-ca-issuer
+    kind: ClusterIssuer
+    group: cert-manager.io
+  commonName: "internal-client"
+  duration: 2160h # 90 days
+  renewBefore: 720h # 30 days
+  privateKey:
+    algorithm: RSA
+    size: 2048
+  usages:
+  - digital signature
+  - key encipherment
+  - client auth
+EOF
+
+# Update NGINX configuration to require client certificates
+# (This would require modifying the NGINX ConfigMap)
+```
+
+### **Set Up Certificate Monitoring**
+
+```bash
+# Create a monitoring script to check certificate expiration
+cat << EOF > /tmp/cert-monitor.sh
+#!/bin/bash
+
+NAMESPACE="$NAMESPACE"
+
+echo "=== Certificate Status Report ==="
+echo "Generated: \$(date)"
+echo ""
+
+echo "Public TLS Certificate (Let's Encrypt):"
+kubectl get certificate e2etls-public-tls-secret -n \$NAMESPACE -o jsonpath='{.status.conditions[0].message}' 2>/dev/null || echo "Certificate not found"
+kubectl get certificate e2etls-public-tls-secret -n \$NAMESPACE -o jsonpath='{.status.notAfter}' 2>/dev/null | xargs -I {} echo "Expires: {}"
+echo ""
+
+echo "Internal App Certificate (Self-Signed CA):"
+kubectl get certificate nginx-app-certificate -n \$NAMESPACE -o jsonpath='{.status.conditions[0].message}' 2>/dev/null || echo "Certificate not found"
+kubectl get certificate nginx-app-certificate -n \$NAMESPACE -o jsonpath='{.status.notAfter}' 2>/dev/null | xargs -I {} echo "Expires: {}"
+echo ""
+
+echo "Root CA Certificate:"
+kubectl get certificate root-ca-certificate -n cert-manager -o jsonpath='{.status.conditions[0].message}' 2>/dev/null || echo "Certificate not found"
+kubectl get certificate root-ca-certificate -n cert-manager -o jsonpath='{.status.notAfter}' 2>/dev/null | xargs -I {} echo "Expires: {}"
+echo ""
+
+echo "ClusterIssuer Status:"
+kubectl get clusterissuers -o custom-columns="NAME:.metadata.name,READY:.status.conditions[0].status,MESSAGE:.status.conditions[0].message"
+EOF
+
+chmod +x /tmp/cert-monitor.sh
+/tmp/cert-monitor.sh
+```
+
+---
+
+## Troubleshooting Common Issues
+
+### **Backend Certificate Verification Failures**
+
+If NGINX Ingress cannot verify the backend certificate:
+
+```bash
+# Check NGINX Ingress logs for SSL errors
+kubectl logs -n ingress-nginx deployment/ingress-nginx-controller | grep -i ssl
+
+# Common error patterns:
+# - "SSL certificate verify error"
+# - "certificate verify failed"
+# - "unable to get local issuer certificate"
+
+# Solution: Verify CA bundle is properly mounted
+kubectl exec -n ingress-nginx deployment/ingress-nginx-controller -- ls -la /etc/ssl/certs/ca-bundle.crt
+
+# If missing, recreate the CA bundle secret and restart ingress
+kubectl delete secret internal-ca-bundle -n ingress-nginx
+kubectl get secret root-ca-secret --namespace cert-manager \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+kubectl create secret generic internal-ca-bundle \
+  --namespace ingress-nginx \
+  --from-file=ca.crt=/dev/stdin
+
+kubectl rollout restart deployment/ingress-nginx-controller -n ingress-nginx
+```
+
+### **Certificate Not Ready**
+
+```bash
+# Check certificate creation events
+kubectl describe certificate nginx-app-certificate --namespace $NAMESPACE
+kubectl describe certificate e2etls-public-tls-secret --namespace $NAMESPACE
+
+# Check cert-manager logs
+kubectl logs -n cert-manager deployment/cert-manager --tail=50
+
+# Common issues:
+# - ClusterIssuer not ready
+# - DNS resolution problems
+# - ACME challenge failures (for Let's Encrypt)
+```
+
+### **Application Pod TLS Issues**
+
+```bash
+# Check if TLS secret is properly mounted
+kubectl exec -n $NAMESPACE deployment/nginx-app -- ls -la /etc/ssl/certs/
+
+# Expected files:
+# tls.crt (application certificate)
+# tls.key (private key)  
+# ca-bundle.crt (root CA certificate)
+
+# Test application TLS configuration
+kubectl exec -n $NAMESPACE deployment/nginx-app -- nginx -t
+
+# Check application logs
+kubectl logs -n $NAMESPACE deployment/nginx-app
+```
+
+---
+
+## Security Considerations and Best Practices
+
+### **Production Security Recommendations**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              PRODUCTION SECURITY CHECKLIST                  │
+│                                                             │
+│  🔒 Certificate Management:                                 │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ✅ Use separate CAs for different environments      │   │
+│  │ ✅ Implement certificate rotation policies          │   │
+│  │ ✅ Monitor certificate expiration dates             │   │
+│  │ ✅ Backup root CA private keys securely            │   │
+│  │ ✅ Use Hardware Security Modules (HSMs) for CA keys │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  🛡️ Network Security:                                      │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ✅ Network policies for cert-manager namespace      │   │
+│  │ ✅ Restrict CA access to authorized services        │   │
+│  │ ✅ Use mTLS for service-to-service communication   │   │
+│  │ ✅ Implement certificate pinning where appropriate  │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  ⚖️ Operational Security:                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ✅ RBAC for cert-manager resources                  │   │
+│  │ ✅ Pod Security Standards enforcement               │   │
+│  │ ✅ Regular security audits of certificates          │   │
+│  │ ✅ Monitoring and alerting for certificate events   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### **Certificate Lifecycle Management**
+
+```bash
+# Set up automated monitoring for certificate renewals
+cat << EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cert-renewal-monitor
+  namespace: cert-manager
+data:
+  monitor.sh: |
+    #!/bin/bash
+    # Monitor certificate renewals
+    while true; do
+      echo "Checking certificate status..."
+      kubectl get certificates --all-namespaces -o custom-columns="NAMESPACE:.metadata.namespace,NAME:.metadata.name,READY:.status.conditions[0].status,RENEWAL:.status.renewalTime"
+      sleep 3600  # Check every hour
+    done
+EOF
+```
+
+---
+
+## Cleanup
+
+### **Remove Demo Resources**
+
+```bash
+# Delete demo namespace (removes all resources)
+kubectl delete namespace $NAMESPACE
+
+# Delete ClusterIssuers (optional - you might want to keep these)
+kubectl delete clusterissuer internal-ca-issuer
+kubectl delete clusterissuer selfsigned-root-ca
+kubectl delete clusterissuer letsencrypt-http01
+
+# Delete root CA certificate
+kubectl delete certificate root-ca-certificate -n cert-manager
+
+# Uninstall cert-manager (optional)
+helm uninstall cert-manager --namespace cert-manager
+kubectl delete namespace cert-manager
+
+# Uninstall NGINX Ingress (optional)
+helm uninstall ingress-nginx --namespace ingress-nginx
+kubectl delete namespace ingress-nginx
+```
+
+---
+
+## Summary: E2E TLS Achievement
+
+### **✅ What We Built**
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                E2E TLS IMPLEMENTATION SUMMARY               │
+│                                                             │
+│  🏗️ Architecture Components:                               │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ • Self-signed Root CA (1-year validity)            │   │
+│  │ • Internal CA ClusterIssuer (service certificates) │   │
+│  │ • Let's Encrypt ClusterIssuer (public certificates)│   │
+│  │ • NGINX Ingress with upstream TLS verification     │   │
+│  │ • NGINX application with TLS termination           │   │
+│  │ • Automated certificate distribution and trust     │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  🔒 Security Properties:                                   │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ✅ Public traffic encrypted (Let's Encrypt)        │   │
+│  │ ✅ Internal traffic encrypted (Self-signed CA)     │   │
+│  │ ✅ Certificate validation at both layers           │   │
+│  │ ✅ Automated certificate lifecycle management      │   │
+│  │ ✅ No plaintext communication anywhere             │   │
+│  │ ✅ Modern TLS protocols (1.2, 1.3)                │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+│  🎯 Business Value:                                        │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │ ✅ Enterprise-grade security compliance            │   │
+│  │ ✅ Zero-downtime certificate updates               │   │
+│  │ ✅ Reduced operational overhead                     │   │
+│  │ ✅ Scalable multi-service architecture             │   │
+│  │ ✅ Production-ready automation                      │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### **🎓 Key Learning Outcomes**
+
+This implementation demonstrates:
+
+- **Two-tier Certificate Architecture**: Public trust for external clients, private CA for internal services
+- **Automated Trust Distribution**: CA bundles automatically injected into ingress and application pods
+- **End-to-End Encryption**: No plaintext communication between any components
+- **Certificate Lifecycle Automation**: Both public and private certificates managed by cert-manager
+- **Production-Ready Security**: Modern TLS protocols, proper certificate validation, automated renewal
+
+### **🚀 Next Steps for Production**
+
+1. **Enhanced Monitoring**: Integrate with Prometheus/Grafana for certificate monitoring
+2. **Policy Enforcement**: Implement Pod Security Standards and Network Policies
+3. **Backup Strategy**: Secure backup of root CA private keys
+4. **mTLS Implementation**: Add mutual TLS for service-to-service authentication
+5. **Compliance Reporting**: Automated certificate compliance auditing
+
+This end-to-end TLS setup provides enterprise-grade security while maintaining the operational benefits of Kubernetes-native certificate management through cert-manager!
+
+---
+
+## Appendix: ClusterIssuer Architecture Deep Dive
+
+### **Understanding the Two-Step Certificate Authority Hierarchy**
+
+In our end-to-end TLS implementation, we use a **two-step CA hierarchy** with distinct roles for each ClusterIssuer. This architectural pattern is common in enterprise PKI implementations and provides both security and operational benefits.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                           TWO-STEP CA HIERARCHY ARCHITECTURE                                        │
+│                                                                                                     │
+│  🏛️ STEP 1: ROOT CA CREATION                    🔧 STEP 2: SERVICE CERTIFICATE MINTING            │
+│                                                                                                     │
+│  ┌─────────────────────────────────────────┐     ┌─────────────────────────────────────────────┐   │
+│  │ ClusterIssuer: selfsigned-root-ca       │     │ ClusterIssuer: internal-ca-issuer          │   │
+│  │ Type: selfSigned: {}                    │     │ Type: ca: {secretName: root-ca-secret}      │   │
+│  │                                         │     │                                             │   │
+│  │ Purpose:                                │     │ Purpose:                                    │   │
+│  │ • Creates the root certificate ONCE    │────▶│ • Mints service certificates ON-DEMAND     │   │
+│  │ • Self-signs its own certificate       │     │ • Uses root CA to sign service certs       │   │
+│  │ • Establishes the trust anchor         │     │ • Handles certificate lifecycle            │   │
+│  │ • 1-year validity (long-lived)         │     │ • 90-day validity (frequently renewed)     │   │
+│  │                                         │     │                                             │   │
+│  │ Creates:                                │     │ Creates:                                    │   │
+│  │ ┌─────────────────────────────────────┐ │     │ ┌─────────────────────────────────────────┐ │   │
+│  │ │ Certificate: root-ca-certificate    │ │     │ │ Certificate: nginx-app-certificate      │ │   │
+│  │ │ Namespace: cert-manager             │ │     │ │ Namespace: e2etls-demo                  │ │   │
+│  │ │ Secret: root-ca-secret              │ │     │ │ Secret: nginx-app-tls-secret            │ │   │
+│  │ │ CN: "E2E TLS Root CA"               │ │     │ │ CN: nginx-app-service...svc.cluster...  │ │   │
+│  │ │ Usage: Certificate signing          │ │     │ │ Usage: Server authentication           │ │   │
+│  │ │ isCA: true                          │ │     │ │ isCA: false                             │ │   │
+│  │ └─────────────────────────────────────┘ │     │ └─────────────────────────────────────────┘ │   │
+│  └─────────────────────────────────────────┘     └─────────────────────────────────────────────┘   │
+│                                                                                                     │
+│  🔑 Key Architectural Decisions:                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. SEPARATION OF CONCERNS: Root CA creation vs. service certificate management               │   │
+│  │ 2. SECURITY ISOLATION: Root CA private key only used for initial setup                      │   │
+│  │ 3. OPERATIONAL EFFICIENCY: Service certificates automated without root CA involvement        │   │
+│  │ 4. COMPLIANCE ALIGNMENT: Standard enterprise PKI pattern for certificate hierarchies        │   │
+│  │ 5. SCALABILITY: Root CA stable while service certificates scale independently                │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### **Detailed Role Analysis**
+
+#### **`selfsigned-root-ca` ClusterIssuer**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-root-ca
+spec:
+  selfSigned: {}
+```
+
+**Role and Responsibilities:**
+- **Primary Function**: Creates the foundational root certificate that establishes trust for the entire internal PKI hierarchy
+- **Operation Mode**: Self-signing - creates a certificate where the issuer and subject are the same entity
+- **Usage Pattern**: Used ONCE to create the root CA certificate, then remains dormant
+- **Security Model**: No external dependencies, creates cryptographically secure self-signed certificate
+
+**When It's Used:**
+```yaml
+# Only used by this single Certificate resource:
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: root-ca-certificate
+  namespace: cert-manager
+spec:
+  issuerRef:
+    name: selfsigned-root-ca  # ← Uses this ClusterIssuer
+    kind: ClusterIssuer
+  isCA: true  # ← This makes it a Certificate Authority
+```
+
+#### **`internal-ca-issuer` ClusterIssuer**
+
+```yaml
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: internal-ca-issuer
+spec:
+  ca:
+    secretName: root-ca-secret  # ← References the root CA's private key
+```
+
+**Role and Responsibilities:**
+- **Primary Function**: Mints service certificates for applications, signed by the root CA
+- **Operation Mode**: CA-based signing - uses the root CA's private key to sign new certificates
+- **Usage Pattern**: Used REPEATEDLY for every service certificate request
+- **Security Model**: Validates certificate requests and signs them with the established root CA authority
+
+**When It's Used:**
+```yaml
+# Used by service Certificate resources:
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: nginx-app-certificate
+  namespace: e2etls-demo
+spec:
+  issuerRef:
+    name: internal-ca-issuer  # ← Uses this ClusterIssuer
+    kind: ClusterIssuer
+  isCA: false  # ← This makes it a service certificate, not a CA
+```
+
+### **Certificate Minting Process Flow**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                              CERTIFICATE MINTING WORKFLOW                                          │
+│                                                                                                     │
+│  📋 PHASE 1: Root CA Bootstrap (One-time Setup)                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Step 1: Admin creates selfsigned-root-ca ClusterIssuer                                     │   │
+│  │         kubectl apply -f selfsigned-root-ca-clusterissuer.yaml                             │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 2: Admin creates root-ca-certificate Certificate                                      │   │
+│  │         kubectl apply -f root-ca-certificate.yaml                                          │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 3: cert-manager processes Certificate with selfsigned-root-ca                        │   │
+│  │         • Generates RSA 4096-bit private key                                               │   │
+│  │         • Creates self-signed certificate with CA=true                                     │   │
+│  │         • Stores both in root-ca-secret                                                    │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 4: Admin creates internal-ca-issuer ClusterIssuer                                     │   │
+│  │         • References root-ca-secret as signing authority                                   │   │
+│  │         • ClusterIssuer becomes READY for service certificates                            │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                     │
+│  🔄 PHASE 2: Service Certificate Lifecycle (Ongoing Operations)                                    │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ Step 1: Application deployment creates service Certificate                                  │   │
+│  │         kubectl apply -f nginx-app-certificate.yaml                                        │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 2: cert-manager detects new Certificate request                                       │   │
+│  │         • Reads Certificate spec with issuerRef: internal-ca-issuer                       │   │
+│  │         • Generates RSA 2048-bit private key for service                                   │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 3: cert-manager creates Certificate Signing Request (CSR)                            │   │
+│  │         • Subject: CN=nginx-app-service.e2etls-demo.svc.cluster.local                     │   │
+│  │         • SAN: DNS names for service discovery                                             │   │
+│  │         • Usage: server auth, digital signature, key encipherment                         │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 4: internal-ca-issuer signs the CSR                                                   │   │
+│  │         • Retrieves root CA private key from root-ca-secret                               │   │
+│  │         • Signs CSR with root CA, creating service certificate                            │   │
+│  │         • Sets validity period (90 days)                                                   │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 5: cert-manager stores signed certificate                                             │   │
+│  │         • Creates nginx-app-tls-secret with cert and key                                   │   │
+│  │         • Certificate becomes READY for pod mounting                                       │   │
+│  │                                    ▼                                                       │   │
+│  │ Step 6: Application pod mounts certificate                                                 │   │
+│  │         • NGINX serves HTTPS with service certificate                                      │   │
+│  │         • Trust chain: Service Cert ← Root CA ← Self-signed                               │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### **Why Two ClusterIssuers Instead of One?**
+
+#### **❌ Single ClusterIssuer Approach (Not Recommended)**
+```yaml
+# This approach would be problematic:
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: everything-issuer
+spec:
+  selfSigned: {}  # Would self-sign EVERY certificate
+```
+
+**Problems with single ClusterIssuer:**
+- Each certificate would be independently self-signed (no chain of trust)
+- No centralized trust anchor for certificate validation
+- Difficult to manage trust distribution to applications
+- No certificate hierarchy for enterprise compliance
+- Scaling issues with trust management
+
+#### **✅ Two-Tier ClusterIssuer Approach (Recommended)**
+
+**Benefits of the two-step approach:**
+
+1. **Proper Certificate Hierarchy**
+   ```
+   Root CA Certificate (self-signed, 1 year)
+   └── Service Certificate 1 (CA-signed, 90 days)
+   └── Service Certificate 2 (CA-signed, 90 days)
+   └── Service Certificate N (CA-signed, 90 days)
+   ```
+
+2. **Centralized Trust Management**
+   - Single root CA certificate to distribute to all services
+   - Consistent trust validation across the cluster
+   - Simplified certificate chain verification
+
+3. **Operational Efficiency**
+   - Root CA operations are rare (annual renewal)
+   - Service certificate operations are automated (90-day lifecycle)
+   - Clear separation between infrastructure and application concerns
+
+4. **Security Best Practices**
+   - Root CA private key has minimal exposure
+   - Service certificates can be revoked without affecting root trust
+   - Supports certificate rotation without trust reconfiguration
+
+### **Certificate Trust Chain Validation**
+
+When an application validates a service certificate, it follows this trust chain:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                TRUST CHAIN VALIDATION                                               │
+│                                                                                                     │
+│  🔍 NGINX Ingress validates backend certificate:                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. Receives service certificate from nginx-app pod                                         │   │
+│  │    Subject: CN=nginx-app-service.e2etls-demo.svc.cluster.local                            │   │
+│  │    Issuer: CN=E2E TLS Root CA                                                             │   │
+│  │                                    ▼                                                       │   │
+│  │ 2. Checks service certificate signature                                                    │   │
+│  │    • Extract issuer information from service certificate                                   │   │
+│  │    • Look up "E2E TLS Root CA" in trusted CA bundle                                       │   │
+│  │                                    ▼                                                       │   │
+│  │ 3. Validates signature using root CA public key                                           │   │
+│  │    • Root CA public key from /etc/ssl/certs/ca-bundle.crt                                 │   │
+│  │    • Cryptographic verification of certificate signature                                   │   │
+│  │                                    ▼                                                       │   │
+│  │ 4. Checks certificate validity                                                             │   │
+│  │    • Current time within certificate validity period                                       │   │
+│  │    • Certificate not in revocation list (if configured)                                   │   │
+│  │                                    ▼                                                       │   │
+│  │ 5. Validates certificate usage                                                             │   │
+│  │    • Extended Key Usage: serverAuth ✅                                                     │   │
+│  │    • Subject Alternative Names match connection target ✅                                 │   │
+│  │                                    ▼                                                       │   │
+│  │ 6. Establishes TLS connection                                                              │   │
+│  │    ✅ Certificate valid and trusted - proceed with HTTPS                                   │   │
+│  └─────────────────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### **Troubleshooting ClusterIssuer Issues**
+
+#### **Common Problems and Solutions**
+
+1. **ClusterIssuer Not Ready**
+   ```bash
+   # Check ClusterIssuer status
+   kubectl describe clusterissuer internal-ca-issuer
+   
+   # Look for these conditions:
+   # Type: Ready
+   # Status: True
+   # Reason: KeyPairVerified
+   ```
+
+2. **Root CA Secret Missing**
+   ```bash
+   # Verify root CA secret exists
+   kubectl get secret root-ca-secret -n cert-manager
+   
+   # If missing, the root-ca-certificate may have failed
+   kubectl describe certificate root-ca-certificate -n cert-manager
+   ```
+
+3. **Service Certificate Failures**
+   ```bash
+   # Check certificate events
+   kubectl describe certificate nginx-app-certificate -n e2etls-demo
+   
+   # Look for:
+   # Events: Certificate issued successfully
+   # Status: Certificate is up to date and has not expired
+   ```
+
+#### **Verification Commands**
+
+```bash
+# Complete ClusterIssuer health check
+echo "=== ClusterIssuer Status ==="
+kubectl get clusterissuers -o wide
+
+echo "=== Root CA Certificate ==="
+kubectl get certificate root-ca-certificate -n cert-manager -o yaml
+
+echo "=== Service Certificates ==="
+kubectl get certificates --all-namespaces
+
+echo "=== Certificate Trust Chain ==="
+# Extract and display the certificate chain
+kubectl get secret root-ca-secret -n cert-manager \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+  openssl x509 -noout -text -subject -issuer -dates
+
+kubectl get secret nginx-app-tls-secret -n e2etls-demo \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | \
+  openssl x509 -noout -text -subject -issuer -dates
+```
+
+This two-step ClusterIssuer architecture provides the foundation for scalable, secure, and manageable certificate operations in your Kubernetes cluster while following enterprise PKI best practices!
