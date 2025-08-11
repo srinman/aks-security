@@ -59,7 +59,23 @@ This directory contains comprehensive guides and resources for certificate manag
 
 ---
 
-## 🛠️ Configuration Files
+## � Issuer Mapping (based on [Issuers](https://cert-manager.io/docs/configuration/issuers/))
+
+| Lab | Primary issuer type | Notes |
+|-----|----------------------|-------|
+| cert-generation-basics.md | CA | Manual root CA is created via self-signed cert, then used to sign leaf certs (equivalent to cert-manager CA issuer behavior). |
+| cert-generation-semiautomated.md | ACME | Uses certbot with Let’s Encrypt (DNS-01). |
+| cert-generation-automatedwithcertmanager.md | ACME | Uses cert-manager with Let’s Encrypt (HTTP-01) via ClusterIssuer. |
+| cert-generation-automatedwithcm-e2etls.md | CA | Uses SelfSigned to bootstrap a root, then CA ClusterIssuer for internal mTLS; also defines an ACME ClusterIssuer for public ingress. |
+| cert-basics.md | N/A | Conceptual fundamentals (no issuer). |
+
+Notes
+- “Vault” issuer is not covered by current labs.
+- Where both ACME and CA are present, the table lists the primary issuer focus for the exercise.
+
+---
+
+## �🛠️ Configuration Files
 
 ### **cert-manager Configurations**
 - **[clusterissuer-http01-simple.yaml](./clusterissuer-http01-simple.yaml)** - Basic HTTP-01 ClusterIssuer
