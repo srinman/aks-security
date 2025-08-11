@@ -526,4 +526,16 @@ After completing the laboratory exercises, consider these advanced topics:
 
 ---
 
+## Certificate Rotation (important, but out of scope for labs)
+
+To keep the exercises focused and approachable, the labs and examples in this folder do not implement automated certificate rotation. In production, rotation is critical for security and reliability:
+
+- Prefer short-lived certificates and automate renewals well before expiry windows.
+- For cert-manager Certificates, set privateKey.rotationPolicy: Always to rotate keys, not just timestamps.
+- Ensure zero-downtime reload of rotated certs (ingress controllers or app hot-reload; avoid restarts where possible).
+- Monitor expiration proactively and alert (e.g., 30/14/7 days before expiry) and track renewal failures.
+- For trust distribution, consider trust-manager to propagate updated CA bundles safely across namespaces.
+
+ACME-based flows (Let’s Encrypt) handle renewal, but your platform/app must still reload updated secrets. Internal CA flows (CA issuers) likewise need automation and safe propagation of trust anchors and issuer certs. Plan, test, and monitor rotation as a first-class operational concern.
+
 **🎓 Learning Path Complete**: You now have a comprehensive understanding of certificate management from basic concepts through advanced automation techniques. The laboratory exercises in this repository provide hands-on experience implementing these concepts in real-world scenarios.
