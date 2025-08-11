@@ -1,4 +1,4 @@
-# Certificate Management for AKS Security
+# Certificate Management for Application Security
 
 This directory contains comprehensive guides and resources for certificate management in Azure Kubernetes Service (AKS) environments, covering everything from basic concepts to advanced automation techniques.
 
