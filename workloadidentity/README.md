@@ -78,9 +78,10 @@ Before the managed identity can access Azure Storage, you need to grant it the a
 
 ```bash
 # Set variables
-STORAGE_ACCOUNT_NAME="<your-storage-account>"
-RESOURCE_GROUP="<storage-resource-group>"
-MANAGED_IDENTITY_CLIENT_ID="<agentpool-identity-client-id>"
+STORAGE_ACCOUNT_NAME="srinmancertblob"
+RESOURCE_GROUP="aks-cert-workshop-rg"
+MANAGED_IDENTITY_CLIENT_ID="ce5b7956-b076-4451-b574-99367c143945"
+CLUSTER_NAME="aks-cert-demo"
 
 # Get the storage account resource ID
 STORAGE_ID=$(az storage account show \
@@ -88,16 +89,23 @@ STORAGE_ID=$(az storage account show \
   -g $RESOURCE_GROUP \
   --query id -o tsv)
 
-# Get the managed identity object ID
-IDENTITY_OBJECT_ID=$(az identity show \
-  --ids $(az aks show -g <aks-rg> -n <aks-name> --query identityProfile.kubeletidentity.objectId -o tsv) \
-  --query principalId -o tsv)
+# Get the kubelet managed identity's principal ID (for RBAC assignment)
+IDENTITY_PRINCIPAL_ID=$(az aks show \
+  -g $RESOURCE_GROUP \
+  -n $CLUSTER_NAME \
+  --query identityProfile.kubeletidentity.objectId -o tsv)
+
+# Note: In AKS, the kubeletidentity.objectId IS the principal ID used for RBAC
+# This is different from user-assigned managed identities where objectId != principalId
 
 # Assign the Storage Blob Data Contributor role
 az role assignment create \
-  --assignee $IDENTITY_OBJECT_ID \
+  --assignee $IDENTITY_PRINCIPAL_ID \
   --role "Storage Blob Data Contributor" \
   --scope $STORAGE_ID
+
+
+
 ```
 
 **Alternative Roles:**
@@ -110,18 +118,29 @@ az role assignment create \
 From the AKS node (via the privileged pod):
 
 ```bash
-# Get a token for Azure Storage
-TOKEN=$(curl -s -H "Metadata: true" \
-  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
-  | jq -r '.access_token')
+kubectl exec -it nsenter-test2 -- bash
 
-echo $TOKEN
+# Set the client ID (from Step 3 variables)
+CLIENT_ID="ce5b7956-b076-4451-b574-99367c143945"
+
+# First, check the raw response to see what IMDS returns
+# Note: Including client_id is REQUIRED when multiple managed identities exist
+curl -s -H "Metadata: true" \
+  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/&client_id=${CLIENT_ID}"
+
+# Extract the token
+TOKEN=$(curl -s -H "Metadata: true" \
+  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/&client_id=${CLIENT_ID}" \
+  | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
+
+
 ```
 
 **Understanding the token request:**
 - `Metadata: true` - Required header to authenticate to IMDS
 - `resource=https://storage.azure.com/` - The audience for the token (Storage in this case)
-- `client_id=<id>` - Optional: specify which managed identity if multiple are assigned
+- `client_id=<id>` - **REQUIRED when multiple managed identities are assigned** - specifies which identity to use
+
 
 #### Step 5: Upload a Blob Using REST API
 
@@ -129,9 +148,9 @@ Now use the token to upload a blob using pure REST API (no SDK needed):
 
 ```bash
 # Set variables
-STORAGE_ACCOUNT="<your-storage-account>"
-CONTAINER_NAME="<container-name>"
-BLOB_NAME="test-from-managed-identity.txt"
+STORAGE_ACCOUNT="srinmancertblob"
+CONTAINER_NAME="container1"
+BLOB_NAME="test2-from-managed-identity.txt"
 BLOB_CONTENT="Hello from AKS node using Managed Identity!"
 
 # Create the blob using PUT request
@@ -165,6 +184,40 @@ curl -H "x-ms-version: 2020-04-08" \
   -H "Authorization: Bearer $TOKEN" \
   "https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER_NAME}/${BLOB_NAME}"
 ```
+
+#### Step 7: Grant Portal Access to View Blobs (Optional)
+
+To view and verify the uploaded blobs from the Azure Portal, grant yourself Storage Blob Data Contributor access:
+
+```bash
+# Exit from the nsenter pod back to your local machine
+exit
+
+# Get your currently signed-in user's object ID
+SIGNED_IN_USER_ID=$(az ad signed-in-user show --query id -o tsv)
+
+# Get the storage account resource ID
+STORAGE_ID=$(az storage account show \
+  -n $STORAGE_ACCOUNT_NAME \
+  -g $RESOURCE_GROUP \
+  --query id -o tsv)
+
+# Grant Storage Blob Data Contributor role to yourself
+az role assignment create \
+  --assignee-object-id $SIGNED_IN_USER_ID \
+  --assignee-principal-type User \
+  --role "Storage Blob Data Contributor" \
+  --scope $STORAGE_ID
+
+echo "✅ Role assigned! You can now view blobs in Azure Portal"
+echo "Navigate to: Storage Account > Containers > <container-name>"
+```
+
+**Note:** Role assignments may take 5-10 minutes to propagate. After that, you can:
+1. Open Azure Portal
+2. Navigate to your storage account: `$STORAGE_ACCOUNT_NAME`
+3. Go to "Containers" → Select your container
+4. View the uploaded blobs
 
 ---
 
@@ -315,7 +368,7 @@ The magic happens through **token exchange**:
 Each AKS cluster with workload identity enabled has an **OIDC issuer endpoint**:
 
 ```bash
-az aks show -g <rg> -n <cluster> --query oidcIssuerProfile.issuerUrl -o tsv
+az aks show -g $RESOURCE_GROUP -n $CLUSTER_NAME --query oidcIssuerProfile.issuerUrl -o tsv
 # Output: https://oidc.prod-aks.azure.com/<tenant-id>/<uuid>/
 ```
 
@@ -329,7 +382,7 @@ This endpoint:
 The **azure-wi-webhook-controller-manager** runs in the cluster:
 
 ```bash
-kubectl get pods -n kube-system -l app.kubernetes.io/name=workload-identity-webhook
+kubectl get pods -n kube-system -l azure-workload-identity.io/system=true
 ```
 
 **What it does:**
@@ -347,7 +400,7 @@ metadata:
   name: workload-sa
   namespace: myapp
   annotations:
-    azure.workload.identity/client-id: "<managed-identity-client-id>"
+    azure.workload.identity/client-id: "$IDENTITY_CLIENT_ID"
   labels:
     azure.workload.identity/use: "true"  # This triggers the webhook
 ```
@@ -433,11 +486,13 @@ This is the "trust bridge" between K8s and Entra ID.
 
 ```bash
 # Variables
-RESOURCE_GROUP="myResourceGroup"
-CLUSTER_NAME="myAKSCluster"
+RESOURCE_GROUP="aks-cert-workshop-rg"
+CLUSTER_NAME="aks-cert-demo"
 LOCATION="eastus"
-STORAGE_ACCOUNT="mystorageacct$(date +%s)"
-CONTAINER_NAME="workload-identity-demo"
+# Use existing storage account from Part 1
+STORAGE_ACCOUNT="srinmancertblob"
+CONTAINER_NAME="container1"
+# Create a new managed identity for workload identity demo
 IDENTITY_NAME="workload-identity-demo"
 NAMESPACE="demo"
 SERVICE_ACCOUNT_NAME="workload-sa"
@@ -472,64 +527,72 @@ OIDC_ISSUER=$(az aks show -g $RESOURCE_GROUP -n $CLUSTER_NAME \
 echo "OIDC Issuer: $OIDC_ISSUER"
 ```
 
-### Step 3: Create Managed Identity
+### Step 3: Create Managed Identity for Workload Identity
+
+Create a new managed identity specifically for the workload identity demo:
 
 ```bash
+# Create a new managed identity
 az identity create \
   --name $IDENTITY_NAME \
   --resource-group $RESOURCE_GROUP \
   --location $LOCATION
 
-# Get the client ID
+# Get the client ID and principal ID
 IDENTITY_CLIENT_ID=$(az identity show \
   --name $IDENTITY_NAME \
   --resource-group $RESOURCE_GROUP \
   --query clientId -o tsv)
 
-echo "Identity Client ID: $IDENTITY_CLIENT_ID"
-```
-
-### Step 4: Create Storage Account and Container
-
-```bash
-# Create storage account
-az storage account create \
-  --name $STORAGE_ACCOUNT \
-  --resource-group $RESOURCE_GROUP \
-  --location $LOCATION \
-  --sku Standard_LRS
-
-# Get storage account ID
-STORAGE_ACCOUNT_ID=$(az storage account show \
-  --name $STORAGE_ACCOUNT \
-  --resource-group $RESOURCE_GROUP \
-  --query id -o tsv)
-
-# Create container
-az storage container create \
-  --name $CONTAINER_NAME \
-  --account-name $STORAGE_ACCOUNT \
-  --auth-mode login
-```
-
-### Step 5: Assign RBAC Role to Managed Identity
-
-```bash
-# Get the managed identity principal ID
 IDENTITY_PRINCIPAL_ID=$(az identity show \
   --name $IDENTITY_NAME \
   --resource-group $RESOURCE_GROUP \
   --query principalId -o tsv)
 
-# Assign Storage Blob Data Contributor role
+echo "Identity Client ID: $IDENTITY_CLIENT_ID"
+echo "Identity Principal ID: $IDENTITY_PRINCIPAL_ID"
+```
+
+### Step 4: Get Storage Account Information
+
+We'll use the existing storage account from Part 1:
+
+```bash
+# Get storage account resource ID
+STORAGE_ACCOUNT_ID=$(az storage account show \
+  --name $STORAGE_ACCOUNT \
+  --resource-group $RESOURCE_GROUP \
+  --query id -o tsv)
+
+echo "Storage Account ID: $STORAGE_ACCOUNT_ID"
+
+# Verify the container exists (or create it if needed)
+az storage container exists \
+  --name $CONTAINER_NAME \
+  --account-name $STORAGE_ACCOUNT \
+  --auth-mode login
+```
+
+### Step 5: Assign Storage Blob Data Contributor Role
+
+Grant the new managed identity access to the storage account:
+
+```bash
+# Assign Storage Blob Data Contributor role to the workload identity
 az role assignment create \
   --assignee-object-id $IDENTITY_PRINCIPAL_ID \
   --assignee-principal-type ServicePrincipal \
   --role "Storage Blob Data Contributor" \
   --scope $STORAGE_ACCOUNT_ID
 
-echo "Role assignment complete. Wait 60 seconds for propagation..."
+echo "✅ Role assignment complete. Wait 60 seconds for propagation..."
 sleep 60
+
+# Verify the role assignment
+az role assignment list \
+  --assignee $IDENTITY_PRINCIPAL_ID \
+  --scope $STORAGE_ACCOUNT_ID \
+  --output table
 ```
 
 ### Step 6: Create Kubernetes Namespace and Service Account
@@ -694,9 +757,12 @@ For comparison, use the managed identity approach from Part 1:
 kubectl apply -f sshrootpod.yaml
 kubectl exec -it nsenter-test2 -- bash
 
-# On the node, get token and upload
+# Set the kubelet identity client ID
+CLIENT_ID="ce5b7956-b076-4451-b574-99367c143945"
+
+# On the node, get token and upload (specify client_id for multiple identities)
 TOKEN=$(curl -s -H "Metadata: true" \
-  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/" \
+  "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://storage.azure.com/&client_id=${CLIENT_ID}" \
   | grep -o '"access_token":"[^"]*' | cut -d'"' -f4)
 
 BLOB_NAME="test-from-node-$(date +%s).txt"
