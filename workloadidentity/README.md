@@ -309,6 +309,92 @@ metadata:
 - This token is signed by the Kubernetes API server
 - The token contains claims: namespace, service account name, audience, expiry, etc.
 
+#### 1a. Understanding the Two Service Account Tokens
+
+**Reference:** [Kubernetes ServiceAccount Token Volume Projection](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#serviceaccount-token-volume-projection)
+
+This is a crucial concept that's often misunderstood. Every pod with workload identity has **TWO different service account tokens**:
+
+##### Token 1: Default Service Account Token
+- **Path:** `/var/run/secrets/kubernetes.io/serviceaccount/token`
+- **Issuer:** Kubernetes API Server
+- **Audience:** `kubernetes.default`
+- **Purpose:** Authenticate to Kubernetes API server
+- **Created by:** Kubernetes (automatically for all pods)
+- **Used for:** Pod accessing K8s API resources (ConfigMaps, Secrets, etc.)
+
+##### Token 2: Azure Federated Token (Projected Volume)
+- **Path:** Value of `AZURE_FEDERATED_TOKEN_FILE` environment variable
+  - Typically: `/var/run/secrets/azure/tokens/azure-identity-token`
+- **Issuer:** Kubernetes API Server (same issuer!)
+- **Audience:** `api://AzureADTokenExchange` ⚠️ **This is the critical difference!**
+- **Purpose:** Exchange for Entra ID access token
+- **Created by:** Workload Identity Mutating Webhook (via projected volume)
+- **Used for:** Token exchange with Entra ID for Azure resource access
+
+##### How the Azure Federated Token is Created
+
+The **Workload Identity Mutating Webhook** modifies the pod spec during creation to inject a **projected volume**:
+
+```yaml
+# This is what the webhook adds to your pod spec:
+volumes:
+- name: azure-identity-token
+  projected:
+    defaultMode: 420
+    sources:
+    - serviceAccountToken:
+        audience: api://AzureADTokenExchange  # ← Special audience for Azure!
+        expirationSeconds: 3600
+        path: azure-identity-token
+
+volumeMounts:
+- name: azure-identity-token
+  mountPath: /var/run/secrets/azure/tokens
+  readOnly: true
+```
+
+**What happens:**
+1. Webhook detects pod with label `azure.workload.identity/use: "true"`
+2. Webhook injects projected volume configuration into pod spec
+3. Kubernetes API server generates a **new JWT token** with:
+   - Same issuer (K8s API server)
+   - **Different audience:** `api://AzureADTokenExchange`
+   - Same subject (service account identity)
+4. This projected token is mounted at the specified path
+5. Webhook also injects `AZURE_FEDERATED_TOKEN_FILE` env var pointing to this path
+
+##### Why the Audience Claim Matters
+
+The **audience claim** in a JWT token specifies the intended recipient. This is critical for security:
+
+| Aspect | Default Token | Azure Federated Token |
+|--------|--------------|----------------------|
+| **Audience** | `kubernetes.default` | `api://AzureADTokenExchange` |
+| **Accepted by** | Kubernetes API Server | Microsoft Entra ID |
+| **Rejects** | Entra ID (wrong audience) | K8s API (wrong audience) |
+
+Entra ID **will not accept** a token with audience `kubernetes.default`. It requires `api://AzureADTokenExchange` as specified in the federated credential configuration.
+
+##### Token Comparison Table
+
+| Property | Default SA Token | Azure Federated Token |
+|----------|-----------------|----------------------|
+| **Issuer** | `https://oidc.prod-aks.azure.com/<tenant>/<uuid>/` | `https://oidc.prod-aks.azure.com/<tenant>/<uuid>/` (same) |
+| **Subject** | `system:serviceaccount:<namespace>:<sa-name>` | `system:serviceaccount:<namespace>:<sa-name>` (same) |
+| **Audience** | `kubernetes.default` | `api://AzureADTokenExchange` |
+| **Path** | `/var/run/secrets/kubernetes.io/serviceaccount/token` | `/var/run/secrets/azure/tokens/azure-identity-token` |
+| **Creation** | Automatic (K8s) | Webhook-injected projected volume |
+| **Use case** | K8s API authentication | Azure token exchange |
+| **Environment variable** | None (hardcoded path) | `AZURE_FEDERATED_TOKEN_FILE` |
+
+##### Key Insight
+
+**Both tokens are issued by the same Kubernetes API server**, but they have different audience claims. The workload identity webhook's job is to:
+1. **Inject a projected volume** requesting a token with the Azure-specific audience
+2. **Inject environment variables** so the application knows where to find this token
+3. Make the token exchange process transparent to the application
+
 #### 2. Establishing Trust: Federated Identity Credentials
 
 The key innovation is creating a **federated identity credential** that establishes trust between:
@@ -386,11 +472,37 @@ kubectl get pods -n kube-system -l azure-workload-identity.io/system=true
 ```
 
 **What it does:**
-- Watches for pods with labeled Service Accounts
-- Mutates pod specs to inject:
-  - Environment variables for Azure SDK
-  - Projected volume for federated token
-  - Token refresh configuration
+- Watches for pods with labeled Service Accounts (label: `azure.workload.identity/use: "true"`)
+- **Mutates pod specs** before they're created by injecting:
+  
+  **1. Environment Variables:**
+  - `AZURE_CLIENT_ID` - The managed identity client ID (from SA annotation)
+  - `AZURE_TENANT_ID` - The Azure tenant ID
+  - `AZURE_FEDERATED_TOKEN_FILE` - Path to the projected token
+  - `AZURE_AUTHORITY_HOST` - Entra ID endpoint
+  
+  **2. Projected Volume for Azure Federated Token:**
+  ```yaml
+  volumes:
+  - name: azure-identity-token
+    projected:
+      sources:
+      - serviceAccountToken:
+          audience: api://AzureADTokenExchange  # Critical: Azure-specific audience
+          expirationSeconds: 3600
+          path: azure-identity-token
+  ```
+  This instructs Kubernetes to create a **second service account token** with the audience claim required by Entra ID.
+  
+  **3. Volume Mount:**
+  ```yaml
+  volumeMounts:
+  - name: azure-identity-token
+    mountPath: /var/run/secrets/azure/tokens
+    readOnly: true
+  ```
+
+**Important:** The webhook does NOT create the token itself. It only modifies the pod spec to request that Kubernetes API server create a projected token with the correct audience claim.
 
 **Service Account Label:**
 ```yaml
@@ -416,15 +528,26 @@ This is the "trust bridge" between K8s and Entra ID.
 
 ### Token Exchange Process (Detailed)
 
-1. **Pod Start**
-   - Webhook injects environment variables and volume mount
-   - Pod has access to K8s Service Account token at `/var/run/secrets/azure/tokens/azure-identity-token`
+1. **Pod Creation (Webhook Mutation)**
+   - Pod spec submitted with label `azure.workload.identity/use: "true"`
+   - Webhook intercepts and modifies the pod spec:
+     - Adds projected volume requesting token with audience `api://AzureADTokenExchange`
+     - Adds volume mount at `/var/run/secrets/azure/tokens`
+     - Injects environment variables (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_FEDERATED_TOKEN_FILE`)
 
-2. **Application Initialization**
+2. **Pod Start (K8s Token Generation)**
+   - Kubernetes API server creates the pod
+   - K8s generates **two service account tokens**:
+     - Default token → `/var/run/secrets/kubernetes.io/serviceaccount/token` (audience: `kubernetes.default`)
+     - Projected token → `/var/run/secrets/azure/tokens/azure-identity-token` (audience: `api://AzureADTokenExchange`)
+   - Both tokens signed by K8s API server, same issuer, but different audience
+
+3. **Application Initialization**
    - Azure SDK (or manual REST call) reads environment variables
-   - Reads the K8s token from the file
+   - Reads the **Azure federated token** from `$AZURE_FEDERATED_TOKEN_FILE`
+   - Note: The default SA token at `/var/run/secrets/kubernetes.io/serviceaccount/token` is NOT used for Azure access
 
-3. **Token Exchange Request**
+4. **Token Exchange Request**
    ```http
    POST https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token
    Content-Type: application/x-www-form-urlencoded
@@ -484,11 +607,13 @@ This is the "trust bridge" between K8s and Entra ID.
 
 ### Prerequisites
 
+For demos, change IDENTITY_NAME to a new value (in an existing cluster with demo)
+
 ```bash
 # Variables
 RESOURCE_GROUP="aks-cert-workshop-rg"
 CLUSTER_NAME="aks-cert-demo"
-LOCATION="eastus"
+LOCATION="westus"
 # Use existing storage account from Part 1
 STORAGE_ACCOUNT="srinmancertblob"
 CONTAINER_NAME="container1"
@@ -533,6 +658,7 @@ Create a new managed identity specifically for the workload identity demo:
 
 ```bash
 # Create a new managed identity
+
 az identity create \
   --name $IDENTITY_NAME \
   --resource-group $RESOURCE_GROUP \
@@ -853,8 +979,10 @@ graph TB
         Pod[Pod with Label]
         SA[Service Account<br/>with annotation]
         Webhook[Workload Identity<br/>Mutating Webhook]
+        K8sAPI[Kubernetes API Server<br/>Token Issuer]
         OIDC[OIDC Issuer<br/>Public Keys]
-        PodVolume[Projected Volume<br/>K8s SA Token]
+        DefaultToken[Default SA Token<br/>audience: kubernetes.default<br/>/var/run/secrets/kubernetes.io/serviceaccount/token]
+        AzureToken[Azure Federated Token<br/>audience: api://AzureADTokenExchange<br/>/var/run/secrets/azure/tokens/azure-identity-token]
     end
     
     subgraph Entra["Microsoft Entra ID"]
@@ -873,9 +1001,11 @@ graph TB
     MI --> FedCred
     FedCred -.trusts.-> SA
     
-    Webhook -->|1. Mutate Pod<br/>Inject env vars| Pod
-    Webhook -->|2. Mount token| PodVolume
-    Pod -->|3. Read K8s token| PodVolume
+    Webhook -->|1. Mutate Pod Spec<br/>Add projected volume<br/>Inject env vars| Pod
+    K8sAPI -->|2. Generate tokens| DefaultToken
+    K8sAPI -->|2. Generate tokens| AzureToken
+    DefaultToken -.->|For K8s API auth| Pod
+    Pod -->|3. Read Azure token<br/>from $AZURE_FEDERATED_TOKEN_FILE| AzureToken
     Pod -->|4. Exchange token<br/>POST /oauth2/token| EntraID
     EntraID -->|5. Validate via OIDC| OIDC
     EntraID -->|6. Check trust| FedCred
@@ -887,6 +1017,9 @@ graph TB
     style Pod fill:#e1f5ff
     style SA fill:#cce5ff
     style Webhook fill:#d9f2d9
+    style K8sAPI fill:#ffe6e6
+    style DefaultToken fill:#fff3cd
+    style AzureToken fill:#d4edda
     style FedCred fill:#ffe6cc
     style EntraID fill:#ccf0cc
     style Storage fill:#ffffe1
@@ -896,38 +1029,95 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant Pod as Pod
+    participant User as User/CI
     participant Webhook as Workload Identity<br/>Webhook
     participant K8s as Kubernetes<br/>API Server
+    participant Pod as Pod
     participant Entra as Entra ID<br/>Token Endpoint
     participant OIDC as AKS OIDC<br/>Issuer
     participant Storage as Azure Storage
 
-    Note over Pod,Webhook: Pod Creation Phase
-    Pod->>Webhook: Pod creation (has label)
-    Webhook->>Pod: Inject env vars:<br/>AZURE_CLIENT_ID<br/>AZURE_TENANT_ID<br/>AZURE_FEDERATED_TOKEN_FILE
-    Webhook->>Pod: Mount projected volume<br/>for K8s SA token
+    Note over User,K8s: Pod Creation Phase
+    User->>K8s: kubectl apply pod<br/>(label: azure.workload.identity/use=true)
+    K8s->>Webhook: Intercept pod creation
+    Webhook->>Webhook: Modify pod spec:<br/>1. Add projected volume config<br/>2. Add volume mount<br/>3. Inject env vars
+    Webhook->>K8s: Return mutated pod spec
+    
+    Note over K8s,Pod: Token Generation
+    K8s->>K8s: Create pod with mutated spec
+    K8s->>Pod: Generate default SA token<br/>(audience: kubernetes.default)<br/>→ /var/run/secrets/kubernetes.io/serviceaccount/token
+    K8s->>Pod: Generate projected SA token<br/>(audience: api://AzureADTokenExchange)<br/>→ /var/run/secrets/azure/tokens/azure-identity-token
+    K8s->>Pod: Inject env vars:<br/>AZURE_CLIENT_ID<br/>AZURE_TENANT_ID<br/>AZURE_FEDERATED_TOKEN_FILE
     
     Note over Pod,Storage: Runtime: Token Exchange
-    Pod->>Pod: Read K8s SA token<br/>from volume
-    Pod->>Entra: POST /oauth2/token<br/>client_assertion=K8s_token<br/>client_id=managed_identity_id
+    Pod->>Pod: Application reads:<br/>$AZURE_FEDERATED_TOKEN_FILE
+    Pod->>Pod: Load Azure federated token<br/>(NOT the default SA token!)
+    Pod->>Entra: POST /oauth2/token<br/>client_assertion=azure_federated_token<br/>client_id=managed_identity_id
     
     Entra->>OIDC: Fetch public keys<br/>for token validation
     OIDC-->>Entra: Return public keys
     
-    Entra->>Entra: Validate K8s token signature
+    Entra->>Entra: Validate token signature<br/>(issued by K8s API server)
+    Entra->>Entra: Verify audience claim<br/>(api://AzureADTokenExchange)
     Entra->>Entra: Check federated credential<br/>(issuer + subject match)
     
     Entra-->>Pod: Return Entra ID<br/>access token
     
     Note over Pod,Storage: Access Azure Resource
-    Pod->>Storage: PUT /container/blob<br/>Authorization: Bearer entra_token
-    Storage->>Entra: Validate token
+    Pod->>Storage: PUT /container/blob<br/>Authorization: Bearer entra_access_token
+    Storage->>Entra: Validate Entra token
     Entra-->>Storage: Token valid
     Storage-->>Pod: 201 Created
 ```
 
-### Diagram 5: Trust Establishment Flow
+### Diagram 5: Two Service Account Tokens Explained
+
+```mermaid
+graph TB
+    subgraph PodSpec["Pod Specification"]
+        direction TB
+        OriginalPod["Original Pod Spec<br/>apiVersion: v1<br/>kind: Pod<br/>metadata:<br/>  labels:<br/>    azure.workload.identity/use: 'true'<br/>spec:<br/>  serviceAccountName: workload-sa"]
+        
+        Webhook[Workload Identity Webhook]
+        
+        MutatedPod["Mutated Pod Spec<br/>+ volumes:<br/>  - name: azure-identity-token<br/>    projected:<br/>      sources:<br/>      - serviceAccountToken:<br/>          audience: api://AzureADTokenExchange<br/>          path: azure-identity-token<br/>+ volumeMounts:<br/>  - name: azure-identity-token<br/>    mountPath: /var/run/secrets/azure/tokens<br/>+ env:<br/>  - AZURE_FEDERATED_TOKEN_FILE=/var/run/secrets/azure/tokens/azure-identity-token<br/>  - AZURE_CLIENT_ID=...<br/>  - AZURE_TENANT_ID=..."]
+    end
+    
+    subgraph Tokens["Tokens in Running Pod"]
+        direction TB
+        Token1["Token 1: Default SA Token<br/>━━━━━━━━━━━━━━━━━━━━<br/>Path: /var/run/secrets/kubernetes.io/serviceaccount/token<br/>Issuer: K8s API Server<br/>Audience: kubernetes.default<br/>Subject: system:serviceaccount:demo:workload-sa<br/>Use: Kubernetes API authentication<br/>Created: Automatically by Kubernetes"]
+        
+        Token2["Token 2: Azure Federated Token<br/>━━━━━━━━━━━━━━━━━━━━<br/>Path: /var/run/secrets/azure/tokens/azure-identity-token<br/>Issuer: K8s API Server (same!)<br/>Audience: api://AzureADTokenExchange ✨<br/>Subject: system:serviceaccount:demo:workload-sa (same!)<br/>Use: Exchange for Entra ID token<br/>Created: Projected volume (webhook-injected)"]
+    end
+    
+    subgraph Usage["Token Usage"]
+        direction LR
+        UseToken1["Default Token<br/>→ K8s API Server"]-->K8sAPI["✅ Kubernetes API<br/>Accepts audience:<br/>kubernetes.default"]
+        UseToken2["Azure Federated Token<br/>→ Entra ID"]-->EntraID["✅ Entra ID<br/>Accepts audience:<br/>api://AzureADTokenExchange"]
+        
+        UseToken1Wrong["Default Token<br/>→ Entra ID"]-->EntraIDReject["❌ Entra ID<br/>Rejects: Wrong audience"]
+        UseToken2Wrong["Azure Federated Token<br/>→ K8s API"]-->K8sAPIReject["❌ K8s API<br/>Rejects: Wrong audience"]
+    end
+    
+    OriginalPod -->|Intercepted| Webhook
+    Webhook -->|Mutates| MutatedPod
+    MutatedPod -->|K8s creates| Token1
+    MutatedPod -->|K8s creates| Token2
+    Token1 -.-> UseToken1
+    Token2 -.-> UseToken2
+    Token1 -.-> UseToken1Wrong
+    Token2 -.-> UseToken2Wrong
+    
+    style Webhook fill:#d9f2d9
+    style Token1 fill:#fff3cd
+    style Token2 fill:#d4edda
+    style EntraID fill:#ccf0cc
+    style K8sAPI fill:#cce5ff
+    style EntraIDReject fill:#ffcccc
+    style K8sAPIReject fill:#ffcccc
+```
+
+### Diagram 6: Trust Establishment Flow
 
 ```mermaid
 graph TB
@@ -962,7 +1152,7 @@ graph TB
     Note1 -.-> S3
 ```
 
-### Diagram 6: Comparison - Managed Identity vs Workload Identity
+### Diagram 7: Comparison - Managed Identity vs Workload Identity
 
 ```mermaid
 graph TB
@@ -1023,11 +1213,18 @@ graph TB
 
 ## References
 
+### Core Documentation
 1. [Workload Identity Federation Overview](https://learn.microsoft.com/en-us/entra/workload-id/workload-identity-federation)
 2. [AKS Workload Identity Overview](https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview?tabs=python)
 3. [Azure Workload Identity Concepts](https://azure.github.io/azure-workload-identity/docs/concepts.html#service-account)
-4. [Azure Storage REST API Reference](https://learn.microsoft.com/en-us/rest/api/storageservices/)
-5. [Azure Instance Metadata Service](https://learn.microsoft.com/en-us/azure/virtual-machines/instance-metadata-service)
+
+### Kubernetes Service Account Tokens
+4. [Kubernetes ServiceAccount Token Volume Projection](https://kubernetes.io/docs/tasks/configure-pod-container/configure-service-account/#serviceaccount-token-volume-projection) - **Critical reference** for understanding how the webhook creates tokens with different audience claims
+5. [Kubernetes Projected Volumes](https://kubernetes.io/docs/concepts/storage/projected-volumes/) - How Kubernetes creates custom service account tokens
+
+### Azure APIs
+6. [Azure Storage REST API Reference](https://learn.microsoft.com/en-us/rest/api/storageservices/)
+7. [Azure Instance Metadata Service](https://learn.microsoft.com/en-us/azure/virtual-machines/instance-metadata-service)
 
 ---
 
