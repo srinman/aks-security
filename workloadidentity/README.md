@@ -395,6 +395,91 @@ Entra ID **will not accept** a token with audience `kubernetes.default`. It requ
 2. **Inject environment variables** so the application knows where to find this token
 3. Make the token exchange process transparent to the application
 
+##### Inspecting the Tokens
+
+To see the actual difference between these tokens, you can decode them from within a pod:
+
+```bash
+# First, exec into a pod with workload identity enabled
+kubectl exec -it workload-identity-test -n demo -- sh
+
+# View the Default Service Account Token
+echo "=== Default Service Account Token ==="
+cat /var/run/secrets/kubernetes.io/serviceaccount/token | cut -d '.' -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq .
+
+# View the Azure Federated Token
+echo ""
+echo "=== Azure Federated Token ==="
+cat /var/run/secrets/azure/tokens/azure-identity-token | cut -d '.' -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq .
+
+# Or use the environment variable
+echo ""
+echo "=== Azure Federated Token (via env var) ==="
+cat $AZURE_FEDERATED_TOKEN_FILE | cut -d '.' -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq .
+```
+
+**What this command does:**
+- `cut -d '.' -f2` - Extracts the payload (second part) of the JWT token
+- `tr '_-' '/+'` - Converts base64url encoding to standard base64
+- `base64 -d` - Decodes the base64 payload
+- `jq .` - Pretty prints the JSON
+
+**Expected output showing key differences:**
+
+Default token will show:
+```json
+{
+  "aud": [
+    "kubernetes.default"
+  ],
+  "exp": 1704888000,
+  "iat": 1704884400,
+  "iss": "https://oidc.prod-aks.azure.com/<tenant-id>/<uuid>/",
+  "kubernetes.io": {
+    "namespace": "demo",
+    "pod": {
+      "name": "workload-identity-test",
+      "uid": "..."
+    },
+    "serviceaccount": {
+      "name": "workload-sa",
+      "uid": "..."
+    }
+  },
+  "sub": "system:serviceaccount:demo:workload-sa"
+}
+```
+
+Azure federated token will show:
+```json
+{
+  "aud": [
+    "api://AzureADTokenExchange"
+  ],
+  "exp": 1704888000,
+  "iat": 1704884400,
+  "iss": "https://oidc.prod-aks.azure.com/<tenant-id>/<uuid>/",
+  "kubernetes.io": {
+    "namespace": "demo",
+    "pod": {
+      "name": "workload-identity-test",
+      "uid": "..."
+    },
+    "serviceaccount": {
+      "name": "workload-sa",
+      "uid": "..."
+    }
+  },
+  "sub": "system:serviceaccount:demo:workload-sa"
+}
+```
+
+**Notice:**
+- ✅ Same `iss` (issuer) - both from K8s API server
+- ✅ Same `sub` (subject) - both represent the same service account
+- ⚠️ **Different `aud` (audience)** - This is the critical difference!
+- The federated token can be exchanged with Entra ID because its audience matches the federated credential configuration
+
 #### 2. Establishing Trust: Federated Identity Credentials
 
 The key innovation is creating a **federated identity credential** that establishes trust between:
